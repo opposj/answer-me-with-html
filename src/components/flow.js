@@ -32,10 +32,27 @@ A --> C                       ← dashed line
 A -> B -> C                   ← chain
 A -> B & C                    ← fan-out
 (Start)  {Valid?}  [(Database)]  [text with: a colon]   ← rounded / diamond / cylinder / rectangle
+A [Name]                      ← name the node A and show only Name
 *Key node                     ← * prefix highlights
 group Group name: B, C        ← draw a group box around nodes
 \`\`\`
-- The text inside the brackets is the node's identity; later lines can refer to the node by that text alone. The default direction is TB (top to bottom).
+- A node is named by its text alone, by its text in brackets, or by "name [shown text]"; the brackets make the text one label, so a colon inside them stays text. Later lines refer to the node by that name. The default direction is TB (top to bottom).
+- \`am\` is NOT Mermaid, do not conflate them:
+| Mermaid habit | In \`am\` | Write instead |
+| --- | --- | --- |
+| \`A -->\\|yes\\| B\` | 2 nodes, one edge | \`A -> B: yes\` |
+| \`A["x"]\` | a node named \`A["x"]\` | \`A [x]\` |
+| \`A [x]\`, then \`A\` | 2 nodes: \`x\` and \`A\` | \`x -> B\` on later lines |
+| \`%% comment\` | a node named \`%% comment\` | notes in the panel text |
+| \`style A ...\` | a node named \`style A fill\` | \`*A\` highlights |
+| \`A -- B\` | a node named \`A -- B\` | \`->\` solid, \`-->\` dashed |
+| \`A <--> B\` | a node named \`A <\` | two lines, one per direction |
+| \`subgraph X\` | a node of that name | \`group Name: A, B\` |
+| \`A(["t"])\` | a node named \`A(["t"])\` | \`(t)\` round, \`[(t)]\` cylinder |
+| \`A -.-> B\` | a node named \`A -.\` | \`-->\` for a dashed link |
+| \`A [x [y]]\` | an error | restructure the label |
+| \`A -> B; B -> C\` | an error | one link per line |
+| \`A [a<br/>b]\` | \`<br/>\` shows as text | one line; labels wrap |
 - Change markers show what a plan adds, removes and changes. A line can start with + (added), - (removed) or ~ (changed), followed by a space:
 \`\`\`flow LR
 Client -> Gateway
@@ -166,7 +183,9 @@ function parseChain(t, line) {
 function parseNode(t, start, line) {
   let pos = start + t.slice(start).match(/^\s*/)[0].length;
   const hi = t[pos] === '*';
-  if (hi) pos++;
+  if (hi) pos += t.slice(pos).match(/^\*\s*/)[0].length;
+  const id = t.slice(pos).match(/^([^\s[\](){}]+)\s+(?=[\[({])/);
+  if (id) pos += id[0].length;
   const bracket = BRACKETS.find((b) => t.startsWith(b.open, pos));
   let label;
   let end;
@@ -181,7 +200,7 @@ function parseNode(t, start, line) {
     end = pos + m[0].length;
   }
   if (!label) throw new ComponentError(`flow has an empty node: "${t}"`, line);
-  return { node: { id: label, label, shape: bracket?.shape ?? 'rect', explicit: Boolean(bracket), hi }, end };
+  return { node: { id: id ? id[1] : label, label, shape: bracket?.shape ?? 'rect', explicit: Boolean(bracket), hi }, end };
 }
 
 function nodeSize(node) {

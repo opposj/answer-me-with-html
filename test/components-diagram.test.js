@@ -75,6 +75,44 @@ test('parseFlow: square brackets protect node text that contains a colon', () =>
   assert.equal(m.edges[0].label, '引用');
 });
 
+test('parseFlow: a node named before its brackets keeps that name and shows the label', () => {
+  const m = parseFlow('app [L7 HTTP/2] -> next [Beta]');
+  assert.deepEqual([...m.nodes.keys()], ['app', 'next']);
+  assert.equal(m.nodes.get('app').label, 'L7 HTTP/2');
+  assert.deepEqual(m.edges.map((e) => [e.from, e.to]), [['app', 'next']]);
+});
+
+test('parseFlow: the bracketed name and the bare name are one node', () => {
+  const m = parseFlow('next [Beta] -> child [Gamma]\nnext -> child');
+  assert.deepEqual([...m.nodes.keys()], ['next', 'child']);
+  assert.equal(m.edges.length, 2);
+});
+
+test('parseFlow: a colon inside the brackets of a named node stays label text', () => {
+  const m = parseFlow('app [record: 5 B header] -> next [Beta]');
+  assert.deepEqual([...m.nodes.keys()], ['app', 'next']);
+  assert.equal(m.nodes.get('app').label, 'record: 5 B header');
+  assert.equal(m.edges.length, 1);
+  assert.equal(m.edges[0].label, '');
+});
+
+test('parseFlow: a node name before an unclosed bracket reports the line', () => {
+  throwsAt(() => parseFlow('app [record -> next'), 1);
+});
+
+test('parseFlow: a highlight keeps the name and the label with any spacing after the star', () => {
+  for (const [line, label] of [['*a [Alpha]', 'Alpha'], ['* a [Alpha]', 'Alpha'], ['*   a [Alpha]', 'Alpha'],
+    ['*\ta [Alpha]', 'Alpha'], ['* a [(Alpha)]', 'Alpha']]) {
+    const m = parseFlow(line);
+    assert.deepEqual([...m.nodes.keys()], ['a'], line);
+    assert.equal(m.nodes.get('a').hi, true, line);
+    assert.equal(m.nodes.get('a').label, label, line);
+  }
+  const chained = parseFlow('* b [Beta]\nx [X] -> b');
+  assert.deepEqual([...chained.nodes.keys()], ['b', 'x']);
+  assert.equal(chained.edges.length, 1);
+});
+
 test('parseFlow: group declares a group', () => {
   const m = parseFlow('网关 -> 鉴权\n网关 -> 业务\ngroup 后端: 鉴权, 业务');
   assert.deepEqual(m.groups, [{ name: '后端', members: ['鉴权', '业务'], line: 3 }]);
