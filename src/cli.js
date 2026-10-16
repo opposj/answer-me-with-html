@@ -1,9 +1,9 @@
 // am CLI: render / patch / video / lint / theme / list / help. main() takes injected streams and environment variables, for testing.
 
 import { parseArgs } from 'node:util';
-import { readFileSync, writeFileSync, mkdirSync, existsSync, rmSync } from 'node:fs';
+import { readFileSync, writeFileSync, mkdirSync, existsSync, rmSync, statSync } from 'node:fs';
 import { VERSION } from './assets.js';
-import { join, resolve, dirname, basename, sep } from 'node:path';
+import { join, resolve, dirname, basename, extname, sep } from 'node:path';
 import { spawn } from 'node:child_process';
 import { renderDoc, RenderError, LintError } from './render.js';
 import { parseDoc, ParseError, CHOICES, VOICES } from './parse.js';
@@ -12,7 +12,10 @@ import { resolveLanguage } from './language.js';
 import { COMPONENTS } from './components/index.js';
 import { themeNames, getTheme, loadThemes } from './themes/registry.js';
 import { readThemeFile } from './themes/user.js';
-import { checkColors, COLOR_TOKENS } from './themes/check.js';
+import { cmdThemeMarket, THEME_MARKET_USAGE } from './theme-market.js';
+import { checkColors, externalResourceWarnings, COLOR_TOKENS } from './themes/check.js';
+import { FONT_NAMES } from './themes/font-list.js';
+import { THEME_SELECTORS } from './themes/selectors.js';
 import { renderVideo } from './video/render.js';
 import { pickProvider, TtsError } from './video/tts.js';
 import { exportMp4, exportWebm, ExportError } from './video/export.js';
@@ -20,7 +23,7 @@ import { afterRender, clean, usage, mb, CLEAN } from './housekeeping.js';
 import { runUpdateCheck, pageUpdate } from './update.js';
 import { amHome, readConfig, setConfig, resetConfig, configChoices, CONFIG_KEYS, ConfigError } from './config.js';
 import { ensureHome } from './home.js';
-import { hasCommand } from './sys.js';
+import { hasCommand, renameOver } from './sys.js';
 import { loadMath } from './math-load.js';
 import { replacePanel, PatchError } from './patch.js';
 import { readState } from './state.js';
@@ -35,22 +38,25 @@ const MAX_LISTED_WARNINGS = 20;
 const USAGE = `Answer me with HTML ${VERSION} — renders a Markdown draft into a single-file HTML explainer page
 
 Usage:
-  am render <file|->  [-o <path>] [--replace <page>] [--no-open] [--theme ${['auto', ...themeNames('page')].join('|')}]
+  am render <file|->  [-o <file>] [--replace <page>] [--no-open] [--theme ${['auto', ...themeNames('page')].join('|')}]
                       [--template sheet|doc] [--style off|80|strict] [--mode auto|light|dark]
   am patch  <html> --panel <title> [file|-] [--from file] [--theme …] [--no-open]
                                                   replace one ## panel of an existing page and overwrite that HTML in place
-  am video  <file|->  [-o <path>] [--voice auto|elevenlabs|local|system|off] [--mp4] [--webm] [--no-open]
+  am video  <file|->  [-o <file>] [--voice auto|elevenlabs|local|system|off] [--mp4] [--webm] [--no-open]
                       [--theme ${['auto', ...themeNames('video')].join('|')}] [--mode light|dark]
                                                   render a video draft into a 3b1b-style explainer video player page (--mp4 / --webm also save a video file)
   am lint   <file|->  [--style off|80|strict]     run only the STE controlled-writing check
   am config [set <key> <value> | get <key> | reset [key]]  show or change settings
-  am serve  [--port 8765] [--lan] [--public-url <origin>]  serve pages over http on 127.0.0.1 (--lan: on the local network); am render then prints a link:
+  am serve  [--port 8765] [--lan] [--public-url <origin>] [--secret-file <path>]  serve pages over http on 127.0.0.1 (--lan: on the local network); am render then prints a link:
   am clean  [--days 30] [--all] [--dry-run]       delete old pages, old videos and the voice-over cache
   am theme check <name|file.json> [--no-open]     check a theme's colors and contrast, and render specimen pages
+  am theme add <name> [--use] [--force]           install a theme from the catalog (answer-me-with-html.com/themes/); --use makes it the default
+  am theme list [--remote] | update [name] | remove <name>  show, update or delete the themes in your themes folder
   am list                                         list templates, themes and components
   am help [component|format|code|image|video|patch|theme]  show component syntax / page draft format / code block / image syntax / video draft format / patch / theme usage
 
 - A file argument of - reads from stdin (good for heredoc: am render - <<'EOF' ... EOF).
+- -o names an output file, for example -o page.html; it does not name a folder.
 - Output goes to ~/.answer-me-with-html/pages/ by default (change it with the AM_HOME environment variable).
 - A page with STE or code warnings does not open. Fix the draft and render again with --replace <page>: the earlier page is deleted once the new one is written.
 - Set auto-open, the default theme and more with am config; --open / --no-open apply to this run only.
@@ -82,7 +88,7 @@ A -> B
 <div>any content</div>
 \`\`\`
 
-- "## " starts a panel; the letter ID is optional (A, B, C... are assigned automatically). span is a hint: the page sizes panels to fit their content, so wide tables and diagrams need no span. Write span only for a panel that must stand out.
+- "## " starts a panel; the letter ID is optional (A, B, C... are assigned automatically). A capital letter and a space before a capitalized word is read as the ID: write "## B A Miss Goes Unseen" to keep the word "A". span is a hint: the page sizes panels to fit their content, so wide tables and diagrams need no span. Write span only for a panel that must stand out.
 - An image on its own line, ![what it shows](path), becomes a captioned figure and is embedded in the page; see am help image.
 - Math in text: $x^2$ is inline; a block is a line with only $$, the TeX, and a line with only $$ (or one line: $$ E = mc^2 $$). Put a long formula in a block: a block scrolls
   inside its panel, and an inline formula may wrap after = or +. \\$ writes a dollar sign. The TeX is typeset when the page is made (Temml): no script, no network.
@@ -100,7 +106,7 @@ const IMAGE_HELP = `Images: a screenshot, photo or render that already exists as
 - Put the image alone on its line; the alt text becomes its caption, so write what the picture shows (the STE check reads it).
 - Use the absolute path. A relative path is read from the draft file's folder, or from the current folder when the draft comes from stdin. A space in the path is fine.
 - PNG, JPG, GIF, WebP, AVIF and SVG files up to 5 MB. The file is embedded in the page, which stays one file that opens offline.
-- http(s) URLs and data: URIs are left as they are. A URL needs the network when the page is opened.
+- Remote images do not load: the page blocks every remote request, so an http(s) or // URL shows nothing and the render warns about it. Save the image and use its local path. data: URIs work.
 - The page keeps the path of each image. am patch embeds the image again from the file, or from the page when the file is gone.
 - Images are for things a diagram cannot show, such as a real screen. Do not generate or invent images.`;
 
@@ -175,7 +181,7 @@ Client -> Server: ACK
 
 - "## " starts a scene; a scene holds components or Markdown (the picture), and lines that start with > are narration (one beat per line).
 - When narration line N plays, step N of the picture appears: in flow / er / sequence / tree each source line is one step;
-  timeline, limits, table rows, list items and paragraphs step item by item. With more steps than narration lines, the steps are spread across the lines;
+  timeline, limits, chart rows, table rows, list items and paragraphs step item by item. With more steps than narration lines, the steps are spread across the lines;
   with more narration lines than steps, the extra first lines act as an opening and show nothing new.
 - Write [name] in narration: the camera zooms in on the element with that name and highlights it, and the word turns yellow in the caption.
 - Nodes / participants with the same name in adjacent scenes move smoothly from the old position to the new one (cross-scene morph).
@@ -228,8 +234,12 @@ export async function main(argv, io = {}) {
         port: { type: 'string' },
         lan: { type: 'boolean' },
         'public-url': { type: 'string' },
+        'secret-file': { type: 'string' },
         all: { type: 'boolean' },
         'dry-run': { type: 'boolean' },
+        use: { type: 'boolean' },
+        force: { type: 'boolean' },
+        remote: { type: 'boolean' },
         help: { type: 'boolean', short: 'h' },
         version: { type: 'boolean', short: 'v' },
       },
@@ -254,7 +264,7 @@ export async function main(argv, io = {}) {
     case 'config': return cmdConfig([arg, ...rest].filter((x) => x !== undefined), ctx);
     case 'theme': return cmdTheme(arg, rest[0], opts, ctx);
     case 'clean': return cmdClean(opts, { print, fail, env });
-    case 'serve': return cmdServe(opts, { print, fail, env });
+    case 'serve': return cmdServe(opts, ctx);
     case '__update-check': return (await runUpdateCheck(amHome(env))) ? 0 : 1;
     case 'list': return cmdList(ctx), 0;
     case 'help': return cmdHelp(arg, { print, fail });
@@ -291,6 +301,12 @@ async function readStream(stream) {
   return Buffer.concat(chunks).toString('utf8');
 }
 
+// The line bin/am.js adds to an internal error on a Node.js older than 20, so the user knows to update Node rather than report a bug.
+export function oldNodeHint(version = process.version) {
+  if (Number(version.slice(1).split('.')[0]) >= 20) return '';
+  return `Answer me with HTML needs Node.js 20 or newer (found ${version}). Update Node.js: https://nodejs.org/`;
+}
+
 // Whether to open automatically: --open forces it > --no-open > AM_NO_OPEN (not 0) > CI environment > config open.
 export function shouldOpen(opts, env, config) {
   if (opts.open) return true;
@@ -312,12 +328,14 @@ async function cmdRender(src, opts, ctx, baseDir) {
   await loadMath(src);
   let result;
   try {
-    result = renderDoc(src, { theme: opts.theme, template: opts.template, style: opts.style, mode: opts.mode }, { theme, mode, style }, { themes: ctx.themes, baseDir, codeDir: ctx.io.cwd ?? process.cwd(), update: updateFor(config, ctx) });
+    result = renderDoc(src, { theme: opts.theme, template: opts.template, style: opts.style, mode: opts.mode }, { theme, mode, style }, { themes: ctx.themes, baseDir, codeDir: ctx.io.cwd ?? process.cwd(), update: updateFor(config, ctx), closeAfter: config.values.close_after_reply });
   } catch (e) {
     return reportError(e, fail);
   }
   const file = outputPath('pages', result.meta.title, opts, ctx);
+  if (!file) return 2;
   emit(result, file, ctx);
+  if (opts.out && !extname(file)) print('! -o names a file without an extension; use .html for an HTML page');
   // Delete the earlier attempt only now: a render that fails above keeps it.
   if (replaced && replaced !== resolve(file)) rmSync(replaced, { force: true });
   // A page with STE, code or math warnings is likely to be rendered again, so it opens only when --open asks for it.
@@ -351,7 +369,19 @@ Usage:
 - Keeps the page's template, theme, light/dark mode and STE style (recorded on the page's root tag when it was made). Later config changes do not apply to patched pages; to change them add --theme / --mode / --style.
 - If the panel is not found, or the page has no #am-source, the exit code is non-zero and the file is not changed.`;
 
-const THEME_HELP = `Your own theme: one JSON file per theme in ~/.answer-me-with-html/themes/ (AM_HOME moves it)
+const THEME_HELP = `Install a ready-made theme from the catalog at answer-me-with-html.com/themes/
+
+am theme add <name> [--use] [--force]
+- Reads the catalog, downloads themes/<name>.json, checks its size, sha256, colors and links, and saves it to ~/.answer-me-with-html/themes/<name>.json.
+  Only catalog names work, not URLs or paths. --use also makes it the default theme (the same as am config set theme <name>).
+- A file of that name that is not the catalog's is never overwritten (it may be your own theme): add --force to replace it.
+- It asks nothing else. The catalog address can be moved with the AM_CATALOG_URL environment variable (an https URL of an index.json; http only for localhost).
+am theme list [--remote]     built-in themes, then your themes with version and source (catalog, catalog edited, local) and files that cannot be used; --remote also reads the catalog and marks updates and themes you do not have
+am theme update [name]       update themes installed from the catalog; a file you changed is skipped (am theme add <name> --force replaces it)
+am theme remove <name>       delete a theme file (not a built-in theme); if it was the default theme, the default is auto again
+- Where each theme came from is recorded in state.json (catalogThemes). Needs Answer me with HTML 0.5.3 or newer; before that, save the file by hand (see the catalog page).
+
+Your own theme: one JSON file per theme in ~/.answer-me-with-html/themes/ (AM_HOME moves it)
 
 The file name is the theme name: themes/notes.json is theme "notes" (lowercase letters, digits and -; not a built-in name).
 Pick it like a built-in theme: theme: notes in the draft, --theme notes, or am config set theme notes. The draft does not change.
@@ -370,14 +400,25 @@ Pick it like a built-in theme: theme: notes in the draft, --theme notes, or am c
 - label: the name on the page's theme button: a string, or an object with ${languageIds().join(' / ')} strings.
 - tokens: light and dark must each set every color: ${COLOR_TOKENS.join(' ')}.
   common holds values shared by both; --radius --shadow --bw --head-font --font-sans --font-mono are optional.
-- Fonts: name installed fonts only; the default font stack is added as the fallback. No font files are embedded.
+- Fonts: name installed fonts only; the default font stack is added as the fallback.
+- font (optional): a font this tool ships, embedded in a page rendered with the theme: ${FONT_NAMES.join(' | ')}. Use it in css, for example & .am-head h1 { font-family: "Bangers", Impact, sans-serif; }.
+  An older version ignores the field and shows the fallback font.
+- requires (optional): the oldest version of this tool the theme supports, as x.y.z. A newer requirement makes this tool skip the theme.
 - css (optional): start every selector with &, which stands for the theme's root, so the rules apply only under this theme.
+  Target these classes (they stay stable): ${THEME_SELECTORS.join(' ')}.
+  Keep the file self-contained: no url() or image-set() to http(s) or //, no @import, no @font-face, no backslash escapes. A link would send a request each time a page opens.
+  am theme check warns about them; the catalog and am theme add reject them.
+- Diagram tokens (optional): node-fill node-stroke node-width node-radius node-shadow node-text, hi-fill hi-stroke hi-text, edge-color edge-width edge-label, actor-fill actor-stroke actor-text, note-fill note-stroke note-width note-radius, cluster-fill cluster-stroke, lifeline-color, series-1 series-2 series-3 series-4 series-5 series-6 (each with a -- prefix).
+  They restyle what is inside flow, sequence and er diagrams and tree boxes, and each defaults to today's look. The series tokens color the bars, lines and slices of a chart: a fixed palette is the default (a light set and a dark set); a series color below 3:1 against --paper in light or dark gives a warning. Widths and radii are a number or px / em (a bare number is px);
+  --node-shadow is none or drop-shadow(...), like drop-shadow(3px 3px 0 #111). Do not write diagram selectors in css. There is no token for fonts: diagram text is measured for the sans font.
 - video (optional): video-only variables (--v-stage, --v-title-font, --v-cap-fg, --v-cap-bg, --v-glow) and & css for am video.
 - A page carries the built-in themes plus its own theme, so it opens anywhere; readers without your fonts see the fallback.
 - A file with problems is skipped with a warning; am theme check <name|file.json> tells you why.
 
 am theme check <name|file.json> [--no-open]
-- Reports invalid colors, missing variables and contrast below WCAG AA in light and dark (text 4.5:1; status badges 3:1, warning below 4.5:1).
+- Reports invalid colors, missing variables and contrast below WCAG AA in light and dark (text 4.5:1; status badges 3:1, warning below 4.5:1),
+  and diagram text on its fill (node, highlighted node, actor, note, edge label) when the theme sets a diagram token for it. A width, radius or shadow token with a bad value is an error.
+- Warns about external resources in css, video.css and token values (url() or image-set() to http(s) or //, @import, @font-face, backslash escapes).
 - Exits with 1 when there is an error. Without errors it renders two specimen pages (light, dark) with every component.`;
 
 async function cmdPatch(htmlArg, fromArg, opts, ctx) {
@@ -448,7 +489,7 @@ async function cmdPatch(htmlArg, fromArg, opts, ctx) {
       // Video pages also keep the original page's theme, mode and STE strictness (e.g. 3b1b / --style off); this command's arguments win.
       result = await buildVideo(patched, voice, { ...opts, theme: overrides.theme, mode: overrides.mode, style: overrides.style, previousLanguage: page.lang }, config, ctx);
     } else {
-      result = renderDoc(patched, overrides, { theme, mode, style }, { themes: ctx.themes, previousLanguage: page.lang, baseDir: cwd, codeDir: cwd, knownImages: readEmbeddedImages(html), knownCode: readEmbeddedCode(html), update: updateFor(config, ctx) });
+      result = renderDoc(patched, overrides, { theme, mode, style }, { themes: ctx.themes, previousLanguage: page.lang, baseDir: cwd, codeDir: cwd, knownImages: readEmbeddedImages(html), knownCode: readEmbeddedCode(html), update: updateFor(config, ctx), closeAfter: config.values.close_after_reply });
     }
   } catch (e) {
     if (e instanceof TtsError) {
@@ -462,10 +503,12 @@ async function cmdPatch(htmlArg, fromArg, opts, ctx) {
 }
 
 async function cmdVideo(src, opts, ctx) {
-  const { fail } = ctx;
+  const { fail, print } = ctx;
   const config = loadConfig(ctx);
   const voice = opts.voice ?? config.values.voice;
   if (!validVoice(voice, fail)) return 2;
+  let file = opts.out ? outputPath('videos', '', opts, ctx) : null;
+  if (opts.out && !file) return 2;
   let result;
   try {
     result = await buildVideo(src, voice, opts, config, ctx);
@@ -474,8 +517,10 @@ async function cmdVideo(src, opts, ctx) {
     fail(`✗ Voice-over failed: ${e.message}. Add --voice off for captions only`);
     return 1;
   }
-  const file = outputPath('videos', result.meta.title, opts, ctx);
+  file ??= outputPath('videos', result.meta.title, opts, ctx);
+  if (!file) return 2;
   emit(result, file, ctx);
+  if (opts.out && !extname(file)) print('! -o names a file without an extension; use .html for an HTML page');
   for (const format of ['mp4', 'webm']) {
     if (opts[format] && !(await exportVideo(file, result.wav, format, ctx))) return 1;
   }
@@ -542,17 +587,34 @@ function themeWarnings({ fail, themes }) {
 }
 
 // Output path: the -o path when given, otherwise pages/ or videos/ in the data directory. io.now can inject a clock.
-function outputPath(dir, title, opts, { env, io }) {
-  if (opts.out) return resolve(io.cwd ?? process.cwd(), opts.out);
+function outputPath(dir, title, opts, { env, io, fail }) {
+  if (opts.out) {
+    const file = resolve(io.cwd ?? process.cwd(), opts.out);
+    if (statSync(file, { throwIfNoEntry: false })?.isDirectory()) {
+      fail('✗ -o names a folder; give a file path, for example -o page.html');
+      return null;
+    }
+    return file;
+  }
   return join(amHome(env), dir, `${slug(title)}-${stamp(new Date(io.now?.() ?? Date.now()))}.html`);
 }
 
 // Write a page. A page inside the data directory makes it private first; a page saved elsewhere (-o) leaves its folder alone.
+// A page in pages/ is written to a temp file and renamed over the old one, so am serve (src/serve.js) never reloads a half-written
+// page. Elsewhere it is written in place: a rename would replace a symlink with a plain file and drop the file's mode and hard links.
 function writePage(file, html, env) {
   const home = resolve(amHome(env));
-  if (resolve(file).startsWith(home + sep)) ensureHome(home);
+  const path = resolve(file);
+  if (path.startsWith(home + sep)) ensureHome(home);
   mkdirSync(dirname(file), { recursive: true });
-  writeFileSync(file, html);
+  if (!path.startsWith(join(home, 'pages') + sep)) return writeFileSync(file, html);
+  const tmp = join(dirname(file), `.${basename(file)}.${process.pid}.tmp`);
+  try {
+    writeFileSync(tmp, html);
+    renameOver(tmp, file);
+  } finally {
+    rmSync(tmp, { force: true });
+  }
 }
 
 // Write the page, print the path, a one-line summary (note follows the summary) and writing warnings. Shared by render / video / patch.
@@ -580,13 +642,13 @@ function emit(result, file, { print, env }, note = '') {
 function printComponentWarnings(notes = [], print) {
   if (!notes.length) return;
   print(`  diagram ${count(notes.length, 'warning')} (the page is written; fix the draft if that is not what you meant):`);
-  notes.toSorted((a, b) => a.line - b.line).slice(0, MAX_LISTED_WARNINGS).forEach((w) => print(`  L${w.line} [${w.component}] ${w.message}`));
+  [...notes].sort((a, b) => a.line - b.line).slice(0, MAX_LISTED_WARNINGS).forEach((w) => print(`  L${w.line} [${w.component}] ${w.message}`));
   if (notes.length > MAX_LISTED_WARNINGS) print(`  … ${notes.length - MAX_LISTED_WARNINGS} more`);
 }
 
 // Raw HTML the render changed (a placeholder shown as text, a tag or attribute removed). Not STE warnings: they never fail style: strict.
 function printHtmlWarnings(notes = [], print) {
-  const lines = [...new Set(notes.toSorted((a, b) => a.line - b.line).map((w) => `L${w.line} [html] ${w.message}`))];
+  const lines = [...new Set([...notes].sort((a, b) => a.line - b.line).map((w) => `L${w.line} [html] ${w.message}`))];
   if (!lines.length) return;
   print(`  html ${count(lines.length, 'warning')} (the page differs from the draft here; fix the draft if that is not what you meant):`);
   lines.slice(0, MAX_LISTED_WARNINGS).forEach((l) => print(`  ${l}`));
@@ -597,7 +659,7 @@ function printHtmlWarnings(notes = [], print) {
 function printMathWarnings(notes = [], print) {
   if (!notes.length) return;
   print(`  math ${count(notes.length, 'warning')} (the page is written; fix the TeX and render again):`);
-  notes.toSorted((a, b) => a.line - b.line).slice(0, MAX_LISTED_WARNINGS).forEach((w) => print(`  L${w.line} [math] ${w.message}`));
+  [...notes].sort((a, b) => a.line - b.line).slice(0, MAX_LISTED_WARNINGS).forEach((w) => print(`  L${w.line} [math] ${w.message}`));
   if (notes.length > MAX_LISTED_WARNINGS) print(`  … ${notes.length - MAX_LISTED_WARNINGS} more`);
 }
 
@@ -651,13 +713,14 @@ function cmdClean(opts, { print, fail, env }) {
   return 0;
 }
 
-function cmdServe(opts, { print, fail, env }) {
+function cmdServe(opts, { print, fail, env, io }) {
   if (opts.port !== undefined && !(/^\d+$/.test(opts.port.trim()) && Number(opts.port) <= 65535)) {
     fail('✗ --port needs a number from 0 to 65535 (0 picks a free port)');
     return 2;
   }
   const port = opts.port === undefined ? DEFAULT_PORT : Number(opts.port);
-  return runServe({ home: amHome(env), port, lan: !!opts.lan, publicUrl: opts['public-url'], print, fail });
+  const secretFile = opts['secret-file'] === undefined ? undefined : resolve(io?.cwd ?? process.cwd(), opts['secret-file']);
+  return runServe({ home: amHome(env), port, lan: !!opts.lan, publicUrl: opts['public-url'], secretFile, print, fail });
 }
 
 function cmdLint(src, opts, { print, fail }) {
@@ -740,7 +803,7 @@ function cmdConfig(args, { print, fail, env, themes }) {
   for (const [k, spec] of Object.entries(CONFIG_KEYS)) {
     const mark = k in stored ? '*' : ' ';
     const options = spec.type === 'bool' ? 'on | off' : configChoices(k, themes).join(' | ');
-    print(`${mark} ${k.padEnd(13)}${showValue(values[k]).padEnd(10)}${spec.label} (${options})`);
+    print(`${mark} ${k.padEnd(19)}${showValue(values[k]).padEnd(10)}${spec.label} (${options})`);
   }
   if (env.AM_NO_OPEN && env.AM_NO_OPEN !== '0') print('Note: the AM_NO_OPEN environment variable is set and overrides the open setting.');
   print('* marks a value you changed. Change: am config set <key> <value>; reset to default: am config reset [key]');
@@ -771,9 +834,10 @@ function specimenDraft(name, mode) {
 }
 
 function cmdTheme(action, target, opts, ctx) {
+  if (['add', 'list', 'update', 'remove'].includes(action)) return cmdThemeMarket(action, target, opts, ctx);
   const { print, fail, env, io } = ctx;
   if (action !== 'check' || !target) {
-    fail('✗ Usage: am theme check <name|file.json>');
+    fail(`✗ Usage: am theme check <name|file.json> | ${THEME_MARKET_USAGE}`);
     return 2;
   }
   const isFile = /\.json$/i.test(target) || /[\\/]/.test(target);
@@ -791,10 +855,11 @@ function cmdTheme(action, target, opts, ctx) {
   }
   const tokens = theme?.tokens ?? theme?.video?.tokens;
   const colors = tokens ? checkColors({ tokens }) : { errors: [], warnings: [] };
+  const warnings = [...colors.warnings, ...externalResourceWarnings(theme)];
   const all = [...errors, ...colors.errors];
   all.forEach((e) => print(`✗ ${e}`));
-  colors.warnings.forEach((w) => print(`! ${w}`));
-  print(`${name}: ${all.length} error${all.length === 1 ? '' : 's'}, ${colors.warnings.length} warning${colors.warnings.length === 1 ? '' : 's'}`);
+  warnings.forEach((w) => print(`! ${w}`));
+  print(`${name}: ${all.length} error${all.length === 1 ? '' : 's'}, ${warnings.length} warning${warnings.length === 1 ? '' : 's'}`);
   if (all.length) return 1;
   if (!theme.scope.includes('page')) return 0;
 

@@ -2,16 +2,22 @@
 // Every start makes a new secret and writes it to serve.json (mode 0600, removed on exit). A link is /p/<token>/<file> (pages) or
 // /v/<token>/<file> (videos), with token = HMAC-SHA256(secret, "<dir>/<file>"). The server keeps no list of links, a link reveals
 // nothing about other pages, and a restart (new secret) revokes every old link. Only .html files directly inside pages/ and videos/ are served.
+// A served page also gets a script (src/runtime/live.js) that listens on /e/<token>/<file>, with the page's own token: the stream says
+// only that the page file changed, and the page reloads.
 
 import { createServer } from 'node:http';
 import { connect, isIP } from 'node:net';
 import { networkInterfaces, uptime } from 'node:os';
 import { createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
-import { readFileSync, writeFileSync, renameSync, rmSync } from 'node:fs';
-import { lstat, realpath, readFile } from 'node:fs/promises';
+import { readFileSync, writeFileSync, renameSync, rmSync, watch, lstatSync, openSync, fstatSync, closeSync, linkSync, constants as fsConstants } from 'node:fs';
+import { lstat, realpath, readFile, stat } from 'node:fs/promises';
 import { join, resolve, dirname, basename, sep } from 'node:path';
 import { ensureHome } from './home.js';
 import { withoutUpdateNotice } from './render.js';
+import { resolveLanguage } from './language.js';
+import { readPage } from './page.js';
+import { esc } from './svg/text.js';
+import { LIVE_SCRIPT_BODY } from './csp.js';
 
 export const DEFAULT_PORT = 8765;
 const HOST = '127.0.0.1';
@@ -19,6 +25,10 @@ const LAN_BIND = '0.0.0.0';
 const TOKEN_LENGTH = 22;
 const PREFIX = Object.freeze({ p: 'pages', v: 'videos' });
 const PREFIX_OF = Object.freeze({ pages: 'p', videos: 'v' });
+// The event stream of a page in pages/: /e/<token>/<file>, where token is the token of the page link.
+const EVENTS = 'e';
+// Editors and renders replace a file in several steps (src/cli.js writes a temp file and renames it): wait for them to settle.
+const SETTLE_MS = 150;
 // Only loopback names are accepted: an SSH tunnel may map any local port, but a DNS-rebinding page arrives with its own host name.
 const LOOPBACK_HOST = /^(127\.0\.0\.1|localhost|\[::1\])(:\d{1,5})?$/i;
 
@@ -97,6 +107,54 @@ export class ServeError extends Error {
   }
 }
 
+const SECRET_PATTERN = /^[0-9a-f]{64}$/;
+
+// A persisted capability secret is deliberately a plain, private regular file. On POSIX,
+// reject any group/other permission bits before reading it; invalid files are never replaced.
+function loadSecret(secretFile) {
+  if (secretFile === undefined) return randomBytes(32).toString('hex');
+  try {
+    // Windows has no O_NOFOLLOW flag. Check the path before opening there so a link cannot be accepted as a secret file.
+    if (fsConstants.O_NOFOLLOW === undefined && lstatSync(secretFile).isSymbolicLink()) {
+      throw new ServeError('--secret-file must not be a symbolic link');
+    }
+    const flags = fsConstants.O_RDONLY
+      | (fsConstants.O_NOFOLLOW ?? 0)
+      | (fsConstants.O_NONBLOCK ?? 0);
+    const fd = openSync(secretFile, flags);
+    try {
+      const mode = fstatSync(fd);
+      if (!mode.isFile()) throw new ServeError('--secret-file must be a regular file');
+      if (process.platform !== 'win32' && (mode.mode & 0o044)) throw new ServeError('--secret-file must not be readable by group or others');
+      const secret = readFileSync(fd, 'utf8');
+      if (!SECRET_PATTERN.test(secret)) throw new ServeError('--secret-file must contain exactly 64 lowercase hex characters');
+      return secret;
+    } finally {
+      closeSync(fd);
+    }
+  } catch (e) {
+    if (e instanceof ServeError) throw e;
+    if (e?.code !== 'ENOENT') throw new ServeError(`Cannot read --secret-file: ${e.message}`);
+    const secret = randomBytes(32).toString('hex');
+    const tmp = `${secretFile}.${process.pid}.${randomBytes(16).toString('hex')}.tmp`;
+    try {
+      writeFileSync(tmp, secret, { mode: 0o600, flag: 'wx' });
+      try {
+        linkSync(tmp, secretFile);
+      } catch (publishError) {
+        if (publishError?.code === 'EEXIST') return loadSecret(secretFile);
+        throw publishError;
+      }
+      return secret;
+    } catch (writeError) {
+      if (writeError instanceof ServeError) throw writeError;
+      throw new ServeError(`Cannot create --secret-file: ${writeError.message}`);
+    } finally {
+      rmSync(tmp, { force: true });
+    }
+  }
+}
+
 const infoPath = (home) => join(home, 'serve.json');
 
 // The token of one page. dir is "pages" or "videos"; the CLI and the server both use this function.
@@ -107,6 +165,12 @@ export function pageToken(secret, dir, file) {
 export function pageLink({ port, secret, baseUrl }, dir, file) {
   const origin = baseUrl ?? `http://${HOST}:${port}`;
   return `${origin}/${PREFIX_OF[dir]}/${pageToken(secret, dir, file)}/${encodeURIComponent(file)}`;
+}
+
+// The event stream of a page in pages/, as a path on the server that serves the page (the page may be opened through a LAN or public
+// address, so the stream goes to the same origin). It carries the token of the page link.
+export function eventLink({ secret }, file) {
+  return `/${EVENTS}/${pageToken(secret, 'pages', file)}/${encodeURIComponent(file)}`;
 }
 
 // A servable file name: one path segment, no traversal, .html only.
@@ -179,9 +243,10 @@ function writeInfo(home, info) {
 }
 
 // Remove serve.json only when it still describes this server.
-function removeInfo(home, secret) {
+function removeInfo(home, secret, port) {
   try {
-    if (JSON.parse(readFileSync(infoPath(home), 'utf8')).secret === secret) rmSync(infoPath(home), { force: true });
+    const info = JSON.parse(readFileSync(infoPath(home), 'utf8'));
+    if (info.secret === secret && info.port === port) rmSync(infoPath(home), { force: true });
   } catch {
     // Already gone or replaced.
   }
@@ -207,7 +272,139 @@ async function resolvePage(home, dir, file) {
   }
 }
 
-function handler(home, secret, allowedHosts) {
+// The page as served: the reload script goes in before </body>, with the event link and the labels in the page language.
+// The file on disk is not changed, and a page opened from file:// has no script.
+export function withLiveReload(html, eventPath) {
+  const { ui } = resolveLanguage({ declared: readPage(html).lang });
+  const script = `<script data-live="${esc(JSON.stringify({ url: eventPath, ui: ui.live }))}">${LIVE_SCRIPT_BODY}</script>\n`;
+  const at = html.lastIndexOf('</body>');
+  return at === -1 ? html + script : html.slice(0, at) + script + html.slice(at);
+}
+
+// The open event streams, by page file. One watcher on pages/ serves all of them. After a burst of file events settles, each page with
+// a stream is compared with what it was; a page that changed gets one "changed" event on its own streams, and other pages get nothing.
+// The watcher runs only while a stream is open or opening: the last stream to close closes it and the next stream opens a new one, so
+// a pages/ folder that was removed and made again is watched again (on Linux the old watcher can go quiet there without an error).
+function liveStreams(home) {
+  const streams = new Map(); // file -> Set of responses
+  const seen = new Map(); // file -> the page's version when it was last compared
+  let watcher = null;
+  let timer = null;
+  let running = false;
+  let again = false;
+  let opening = 0; // streams between startWatching() and being added to streams
+  const stopIfIdle = () => {
+    if (streams.size === 0 && opening === 0) stopWatching();
+  };
+  // null when the page is gone, or in the middle of a replace: the next file event compares it again.
+  const version = async (file) => {
+    try {
+      const s = await stat(await resolvePage(home, 'pages', file));
+      return `${s.mtimeMs}:${s.size}:${s.ino}`;
+    } catch {
+      return null;
+    }
+  };
+  const compare = async () => {
+    for (const [file, open] of streams) {
+      const now = await version(file);
+      if (now === null || now === seen.get(file)) continue;
+      seen.set(file, now);
+      for (const res of open) if (!res.writableEnded) res.write('event: changed\ndata: changed\n\n');
+    }
+  };
+  const run = async () => {
+    timer = null;
+    if (running) {
+      again = true;
+      return;
+    }
+    running = true;
+    try {
+      do {
+        again = false;
+        await compare();
+      } while (again);
+    } catch {
+      // A page that cannot be read now is compared again on the next event.
+    } finally {
+      running = false;
+    }
+  };
+  const settle = () => {
+    clearTimeout(timer);
+    timer = setTimeout(run, SETTLE_MS);
+  };
+  const startWatching = () => {
+    if (watcher) return;
+    // The folder, not the file: a page replaced by a rename is a new file, and a watch on the old one would go quiet.
+    // Without a watcher (the folder went away) the stream stays open and quiet, and the next stream tries again.
+    try {
+      watcher = watch(join(home, 'pages'), settle);
+    } catch {
+      return;
+    }
+    watcher.on('error', stopWatching);
+  };
+  function stopWatching() {
+    clearTimeout(timer);
+    timer = null;
+    watcher?.close();
+    watcher = null;
+  }
+  return {
+    // The headers go out only after the page's version is recorded, so a change right after the stream opens is not missed.
+    async open(file, res, headers) {
+      startWatching();
+      opening += 1;
+      let now;
+      try {
+        now = await version(file);
+      } finally {
+        opening -= 1;
+      }
+      if (res.destroyed) return stopIfIdle();
+      if (!streams.has(file)) {
+        streams.set(file, new Set());
+        seen.set(file, now);
+      }
+      streams.get(file).add(res);
+      res.on('close', () => {
+        const open = streams.get(file);
+        open?.delete(res);
+        if (open?.size === 0) {
+          streams.delete(file);
+          seen.delete(file);
+        }
+        stopIfIdle();
+      });
+      res.writeHead(200, headers);
+      res.write(': open\n\n'); // sends the headers now, so the browser sees the stream open
+    },
+    close() {
+      stopWatching();
+      for (const open of streams.values()) for (const res of open) res.end();
+      streams.clear();
+    },
+  };
+}
+
+// The event stream of one page. The page is sandboxed without allow-same-origin, so its EventSource arrives with Origin: null and
+// Sec-Fetch-Dest: empty; any other origin or destination is a 404, like a wrong token. GET only, and the stream carries no page content.
+async function openEvents(req, res, home, file, live) {
+  if (req.method !== 'GET') {
+    res.setHeader('Allow', 'GET');
+    return reply(req, res, 405, 'text/plain; charset=utf-8', 'Method not allowed\n');
+  }
+  const { origin, 'sec-fetch-dest': dest } = req.headers;
+  // A request with neither header (curl, an old browser) passes, as on the page route: whoever holds the token can already fetch the
+  // page itself, and the stream carries less than the page.
+  if ((origin !== undefined && origin !== 'null') || (dest !== undefined && dest !== 'empty')) return notFound(req, res);
+  if (!(await resolvePage(home, 'pages', file))) return notFound(req, res);
+  return live.open(file, res, { ...HEADERS, 'Content-Type': 'text/event-stream; charset=utf-8', 'Access-Control-Allow-Origin': 'null' });
+}
+
+function handler(home, secret, allowedHosts, live) {
   return async (req, res) => {
     try {
       if (!hostAllowed(req.headers.host, allowedHosts)) return notFound(req, res);
@@ -219,7 +416,8 @@ function handler(home, secret, allowedHosts) {
       const parts = req.url.split(/[?#]/)[0].split('/');
       if (parts.length !== 4 || parts[0] !== '') return notFound(req, res);
       const [, prefix, token, raw] = parts;
-      const dir = Object.hasOwn(PREFIX, prefix) ? PREFIX[prefix] : undefined;
+      const events = prefix === EVENTS;
+      const dir = events ? 'pages' : Object.hasOwn(PREFIX, prefix) ? PREFIX[prefix] : undefined;
       if (!dir || !token || !raw) return notFound(req, res);
       let file;
       try {
@@ -228,6 +426,7 @@ function handler(home, secret, allowedHosts) {
         return notFound(req, res);
       }
       if (!validFileName(file) || !tokenMatches(secret, dir, file, token)) return notFound(req, res);
+      if (events) return await openEvents(req, res, home, file, live);
       // A page is only opened, never fetched: a browser marks a script's fetch (or a service worker's) with another
       // destination, so a leaked token does not let a script read the page. curl sends no Sec-Fetch-Dest.
       const dest = req.headers['sec-fetch-dest'];
@@ -236,7 +435,8 @@ function handler(home, secret, allowedHosts) {
       if (!real) return notFound(req, res);
       // The new-version button is for the person who made the page: a reader through a LAN or public address gets the page without it.
       const html = await readFile(real);
-      const body = LOOPBACK_HOST.test(req.headers.host) ? html : withoutUpdateNotice(html.toString('utf8'));
+      const page = LOOPBACK_HOST.test(req.headers.host) ? html.toString('utf8') : withoutUpdateNotice(html.toString('utf8'));
+      const body = dir === 'pages' ? withLiveReload(page, eventLink({ secret }, file)) : page;
       return reply(req, res, 200, 'text/html; charset=utf-8', body);
     } catch {
       return notFound(req, res);
@@ -256,7 +456,7 @@ function listening(port, timeout = 500) {
 }
 
 // Default: loopback only. LAN listening and the public link origin are explicit opt-ins.
-export async function startServer({ home, port = DEFAULT_PORT, lan = false, publicUrl, lanAddresses }) {
+export async function startServer({ home, port = DEFAULT_PORT, lan = false, publicUrl, lanAddresses, secretFile }) {
   const addresses = lan ? (lanAddresses ?? lanIPv4Addresses()) : [];
   if (lan && (!addresses.length || addresses.some((address) => isIP(address) !== 4
     || address === LAN_BIND || address.startsWith('127.')))) {
@@ -266,8 +466,9 @@ export async function startServer({ home, port = DEFAULT_PORT, lan = false, publ
   const allowedHosts = [...addresses, ...(publicOrigin ? [new URL(publicOrigin).host] : [])];
   const running = readServeInfo(home);
   if (running && await listening(running.port)) throw new ServeError(`am serve is already running on ${running.baseUrl ?? `http://${HOST}:${running.port}`} (pid ${running.pid}); stop it first`);
-  const secret = randomBytes(32).toString('hex');
-  const server = createServer(handler(home, secret, allowedHosts));
+  const secret = loadSecret(secretFile);
+  const live = liveStreams(home);
+  const server = createServer(handler(home, secret, allowedHosts, live));
   await new Promise((done, fail) => {
     server.once('error', (e) => fail(e.code === 'EADDRINUSE'
       ? new ServeError(`Port ${port} is already in use; pick another with am serve --port <n>`)
@@ -287,7 +488,8 @@ export async function startServer({ home, port = DEFAULT_PORT, lan = false, publ
   let closed;
   const close = () => {
     closed ??= new Promise((done) => {
-      removeInfo(home, secret);
+      removeInfo(home, secret, actual);
+      live.close();
       server.close(() => done());
       server.closeAllConnections();
     });
@@ -297,10 +499,10 @@ export async function startServer({ home, port = DEFAULT_PORT, lan = false, publ
 }
 
 // am serve: run in the foreground until Ctrl-C / SIGTERM / SIGHUP. Resolves with the exit code.
-export async function runServe({ home, port, lan = false, publicUrl, print, fail }) {
+export async function runServe({ home, port, lan = false, publicUrl, secretFile, print, fail }) {
   let srv;
   try {
-    srv = await startServer({ home, port, lan, publicUrl });
+    srv = await startServer({ home, port, lan, publicUrl, secretFile });
   } catch (e) {
     if (!(e instanceof ServeError)) throw e;
     fail(`✗ ${e.message}`);
@@ -312,7 +514,7 @@ export async function runServe({ home, port, lan = false, publicUrl, print, fail
     process.once('SIGINT', stop);
     process.once('SIGTERM', stop);
     process.once('SIGHUP', stop); // the SSH session or terminal that runs the server closed
-    process.once('exit', () => removeInfo(home, srv.secret));
+    process.once('exit', () => removeInfo(home, srv.secret, srv.port));
     if (lan) {
       print(`Serving pages on ${LAN_BIND}:${srv.port} (Ctrl-C to stop). am render prints a link for each page.`);
       print('WARNING: --lan exposes this port on every IPv4 interface, without built-in TLS. A page link is a secret: use a trusted LAN or an HTTPS reverse proxy.');

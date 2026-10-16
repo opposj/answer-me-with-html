@@ -1,11 +1,12 @@
-// New-version notice: once a week a background child process reads package.json on GitHub and writes the result into state.json;
+// New-version notice: once a day a background child process reads package.json on GitHub and writes the result into state.json;
 // on the next render, if a new version exists, print one "! Update hint" line for the Agent, which asks the user, and put a
 // new-version button on the page. Never updates automatically.
 import { spawn } from 'node:child_process';
 import { DAY, writeState } from './state.js';
+import { parseVersion, newer } from './version.js';
 
 export const UPDATE = Object.freeze({
-  checkEveryDays: 7,
+  checkEveryDays: 1,
   hintEveryDays: 3,
   timeoutMs: 5000,
   url: 'https://raw.githubusercontent.com/QingYunA/answer-me-with-html/main/package.json',
@@ -31,21 +32,7 @@ export function parseHighlights(data, version) {
   return lists.length ? Object.fromEntries(lists) : null;
 }
 
-const SEMVER = /^v?(\d+)\.(\d+)\.(\d+)$/;
-
-export function parseVersion(v) {
-  const m = String(v).trim().match(SEMVER);
-  return m ? m.slice(1, 4).map(Number) : null;
-}
-
-// Whether a is newer than b. Returns false when either is not in x.y.z format.
-export function newer(a, b) {
-  const pa = parseVersion(a);
-  const pb = parseVersion(b);
-  if (!pa || !pb) return false;
-  const i = pa.findIndex((n, k) => n !== pb[k]);
-  return i !== -1 && pa[i] > pb[i];
-}
+export { parseVersion, newer };
 
 // The update command for each install method, as the user types it. dsh needs the
 // profile and the package name, so it is filled in by dshUpdateCommand.

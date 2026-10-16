@@ -71,7 +71,7 @@ token 数存在 [bench/corpus/tokens.json](bench/corpus/tokens.json) 里，运�
 
 ## 安装
 
-需要本机装有 [Node.js](https://nodejs.org/) 20 或更高版本。不需要 `npm install`，CLI 已经打包在 skill 里了。
+需要本机装有 [Node.js](https://nodejs.org/) 20 或更高版本。不需要 `npm install`，CLI 已经打包在 skill 里了。还没装 Node.js？用下面推荐的方式安装，Agent 会先问你，再替你装好。
 
 ### 让 Agent 帮你装（推荐）
 
@@ -79,7 +79,7 @@ token 数存在 [bench/corpus/tokens.json](bench/corpus/tokens.json) 里，运�
 
 > 帮我安装 Answer me with HTML：读 https://raw.githubusercontent.com/QingYunA/answer-me-with-html/main/INSTALL.md，照着做。
 
-[INSTALL.md](INSTALL.md) 是写给 Agent 看的。它在 Claude Code 里装插件，在其他 Agent 里装 skill，已有安装会保留，全程不向你提问，用"TCP 三次握手"页面验证后给你一份汇报。如果你的 Agent 打不开链接，用 `npx -y skills add QingYunA/answer-me-with-html -g -y -a <你的 Agent 名>`（Claude Code 是 `-a claude-code`）。
+[INSTALL.md](INSTALL.md) 是写给 Agent 看的。它在 Claude Code 里装插件，在其他 Agent 里装 skill，已有安装会保留，除非缺少 Node.js 或版本低于 20，否则全程不向你提问，用"TCP 三次握手"页面验证后给你一份汇报。如果你的 Agent 打不开链接，用 `npx -y skills add QingYunA/answer-me-with-html -g -y -a <你的 Agent 名>`（Claude Code 是 `-a claude-code`）。
 
 ### Claude Code 插件
 
@@ -172,7 +172,7 @@ Server -> Client: SYN-ACK
 | 任意 Agent | `/answer-me-with-html config open off`，或者直接说"别再自动弹浏览器了" |
 | 终端 | `am config` 查看，`am config set open off` 修改，`am config reset` 恢复默认 |
 
-配置项有 `open`（自动打开浏览器）、`theme`、`mode`（亮色或暗色）、`style`（写作检查）、`update_check` 和 `voice`（视频配音）。默认值和可选值见[参考](docs/reference.zh-CN.md#配置)。
+配置项有 `open`（自动打开浏览器）、`theme`、`mode`（亮色或暗色）、`style`（写作检查）、`update_check`、`close_after_reply`（复制回复后关闭标签页）和 `voice`（视频配音）。默认值和可选值见[参考](docs/reference.zh-CN.md#配置)。
 
 ## 高频模式（推荐）
 
@@ -180,13 +180,13 @@ Server -> Client: SYN-ACK
 
 默认是关的。建议打开：不用每次开口要页面，短结论也和长篇一样好读。页面会堆在 `~/.answer-me-with-html/` 里，用 `am clean` 清理。想打开，把下面这段话粘贴给你的 Agent，让它写进自己的规则文件（比如 `~/.claude/CLAUDE.md` 或 `AGENTS.md`）：
 
-> 帮我打开 Answer me with HTML 的高频模式：在你的全局规则文件里加一条规则——"[answer-me-with-html always-on] 只要回复里给出了结论、总结、方案、对比、评审或讲解，就同时用 answer-me-with-html skill 生成一页 HTML（日常结论用 2～4 个面板），先渲染页面，再写文字回复，回复最后附上页面的 file:// 链接，不要先写文字再渲染。哪怕回答很短也要出，不要因为答案不长就跳过。渲染时加 --no-open，不要弹出浏览器。闲聊、没有结论的一两句话、纯命令输出、我要求纯文本时除外。"
+> 帮我打开 Answer me with HTML 的高频模式：在你的全局规则文件里加一条规则——"[answer-me-with-html always-on] 只要回复里给出了结论、总结、方案、对比、评审或讲解，就同时用 answer-me-with-html skill 生成一页 HTML（日常结论用 2～4 个面板），先渲染页面，再写文字回复，回复最后按 SKILL.md 对当前宿主的要求附上页面链接，不要先写文字再渲染。哪怕回答很短也要出，不要因为答案不长就跳过。渲染时加 --no-open，不要弹出浏览器。闲聊、没有结论的一两句话、纯命令输出、我要求纯文本时除外。"
 
 想关掉，把这条规则删掉即可。想让页面少一点？见[少一点主动](docs/reference.zh-CN.md#少一点主动)。
 
 ## 更新与清理
 
-需要手动更新。Agent 每周向 GitHub 查一次最新版本号，有新版本就告诉你，不会上传任何内容。想更新，对 Agent 说"更新一下 answer-me-with-html"。页面会堆在 `~/.answer-me-with-html/` 里，说"清理一下页面"，Agent 会先问你再删。其他安装方式和全部选项见[参考](docs/reference.zh-CN.md#更新与清理)。
+需要手动更新。使用时，CLI 最多每天在后台向 GitHub 查一次新版本；有新版本时，最多每三天向 Agent 提示一次，不会上传任何内容。想更新，对 Agent 说"更新一下 answer-me-with-html"。页面会堆在 `~/.answer-me-with-html/` 里，说"清理一下页面"，Agent 会先问你再删。其他安装方式和全部选项见[参考](docs/reference.zh-CN.md#更新与清理)。
 
 ## 为什么做这个
 
@@ -230,7 +230,7 @@ SYN_RCVD -> *ESTABLISHED: 收 ACK
 
 - **版面由代码计算:** 面板位置和图形坐标都是算出来的，不靠模型猜。文字不会被截断，网格里也不会留空洞。
 - **出错能自己改:** 稿件写错时，CLI 会给出行号、组件名和一段正确示例。Agent 照着改一次就行。
-- **三套主题:** blueprint 是图纸风，shadcn 是卡片风，paper 适合读长文。默认由 CLI 按内容自动选：长文用 paper，有图表用 blueprint。三套都带亮色和暗色，页面上可以用下拉框随时切换，也可以添加你自己的主题。
+- **三套主题:** blueprint 是图纸风，shadcn 是卡片风，paper 适合读长文。默认由 CLI 按内容自动选：长文用 paper，有图表用 blueprint。三套都带亮色和暗色，页面上可以用下拉框随时切换，也可以添加你自己的主题，或者从[主题库](https://answer-me-with-html.com/zh/themes/)里取一个。
 - **单文件、零依赖:** 产物是一个 `.html`，不引用任何 CDN 或外部字体。断网也能打开，发给别人也能看。
 - **多语言:** 简体中文、繁体中文、英文和日文都有对应的按钮和字体。其他语言也能用，按钮是英文。详见[语言](docs/reference.zh-CN.md#语言)。
 - **写作检查:** 按 ASD-STE100 的思路检查稿件里的文字。句子太长、用词太绕、被动语态都会提醒。默认只提醒，不拦着。
@@ -261,6 +261,7 @@ Agent 会按信息的形状挑组件：
 | `tree` | 目录、模块、分类体系 |
 | `timeline` | 历史、版本、阶段 |
 | `limits` | 当前值和上限的对比 |
+| `chart` | 用数字表格画柱状图、折线图或饼图：多个系列、负值、高亮一行 |
 | `annot` | 逐词点评一句话 |
 | `kv` | 元信息、图纸标题栏 |
 | `callout` | 结论、提示、警告 |
@@ -299,6 +300,7 @@ npm run snapshot  # 与 origin/main 对比生成的 HTML（重构不能改变它
 - [Discord](https://discord.gg/sYQuRRZNzQ)
 - QQ 群：`1127099407`
 - [LINUX DO](https://linux.do) 中文开发者论坛
+- [AtomGit](https://atomgit.com/weixin_43367137/answer-me-with-html)
 
 发现 bug 请提 [GitHub issue](https://github.com/QingYunA/answer-me-with-html/issues)。
 
@@ -314,4 +316,4 @@ npm run snapshot  # 与 origin/main 对比生成的 HTML（重构不能改变它
 
 ## License
 
-[MIT](LICENSE)
+[MIT](LICENSE)。主题可以内嵌的 Bangers 字体使用 [SIL Open Font License 1.1](skills/answer-me-with-html/licenses/OFL-Bangers.txt)。

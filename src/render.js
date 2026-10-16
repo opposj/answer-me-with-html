@@ -8,13 +8,14 @@ import { pageCss } from './themes/index.js';
 import { BUILTIN, AUTO, pickTheme } from './themes/registry.js';
 import { lintDoc } from './lint/ste.js';
 import { esc } from './svg/text.js';
-import { VERSION, RUNTIME_JS, RTL_JS, DELTA_JS, UPDATE_JS } from './assets.js';
+import { VERSION, RUNTIME_JS, DELTA_JS, UPDATE_JS, CLOSE_AFTER_JS } from './assets.js';
 import { rootTag, rootCarrierAttrs, sourceTag } from './page.js';
 import { resolveLanguage } from './language.js';
-import { inlineImages, ImageError, IMAGE_EXAMPLE } from './images.js';
+import { inlineImages, remoteImages, ImageError, IMAGE_EXAMPLE } from './images.js';
 import { renderCode, CodeError } from './code.js';
 import { isolateLtrRuns } from './bidi.js';
 import { hasMath } from './math.js';
+import { cspMeta } from './csp.js';
 
 
 export class RenderError extends Error {
@@ -40,7 +41,8 @@ export class LintError extends Error {
 // baseDir: where relative image paths are read from; codeDir: where relative code paths are read from (the folder the agent works in).
 // knownImages / knownCode: what the page already embeds, the fallback when a file is gone.
 // update: { latest, current, command, highlights } from pageUpdate in src/update.js when a newer version is known; the page then has a new-version button.
-export function renderDoc(source, overrides = {}, defaults = {}, { themes = BUILTIN, previousLanguage, baseDir, codeDir, knownImages, knownCode, update } = {}) {
+// closeAfter: the close_after_reply setting; the page then closes its tab a few seconds after the reply is copied (src/runtime/close-after-reply.js).
+export function renderDoc(source, overrides = {}, defaults = {}, { themes = BUILTIN, previousLanguage, baseDir, codeDir, knownImages, knownCode, update, closeAfter = false } = {}) {
   const choices = { theme: themes.choices('page') };
   const parsed = parseDoc(source, { defaults, choices });
   const meta = applyOverrides(parsed.meta, overrides, { ...CHOICES, ...choices });
@@ -64,7 +66,7 @@ export function renderDoc(source, overrides = {}, defaults = {}, { themes = BUIL
   const page = TEMPLATES[doc.meta.template]({ meta: doc.meta, introHtml, panels, ui, language });
   // A right-to-left page isolates each run of text with no right-to-left letter as left to right (src/bidi.js).
   const body = language.dir === 'rtl' ? isolateLtrRuns(page) : page;
-  const html = shell({ meta: doc.meta, language, body, source, embedded: themes.embedFor(doc.meta.theme, 'page'), update });
+  const html = shell({ meta: doc.meta, language, body, source, embedded: themes.embedFor(doc.meta.theme, 'page'), update, closeAfter });
   return { html, warnings, stats, meta: doc.meta, language };
 }
 
@@ -78,8 +80,25 @@ export function renderBlocks(blocks, ctx) {
     const { result, notes } = collectHtmlNotes(() => (b.type === 'md' ? `<div class="am-md">${md(b.text)}</div>` : renderFence(b, ctx)), { math: !ctx.video });
     noteHtml(b, notes.filter((n) => !n.math), ctx);
     noteMath(b, notes.filter((n) => n.math), ctx);
-    return embedImages(b, result, ctx);
+    const out = embedImages(b, result, ctx);
+    noteRemoteImages(b, out, ctx);
+    return out;
   }).join('\n');
+}
+
+// Each remote image of one block, with the draft line that names it. The page blocks remote content (src/csp.js), so the image would be blank.
+function noteRemoteImages(block, html, ctx) {
+  if (!ctx.stats.htmlWarnings) return;
+  const lines = block.text.split('\n');
+  const first = block.type === 'md' ? block.line : block.line + 1;
+  const used = new Map();
+  for (const ref of remoteImages(html)) {
+    const places = lines.flatMap((l, i) => (l.includes(ref) || l.includes(encodeURI(ref)) ? [i] : []));
+    const n = used.get(ref) ?? 0;
+    used.set(ref, n + 1);
+    const shown = ref.length > 80 ? `${ref.slice(0, 77)}...` : ref;
+    ctx.stats.htmlWarnings.push({ line: first + (places[Math.min(n, places.length - 1)] ?? 0), message: `remote image ${shown} does not load in the page; save the image and use its local path` });
+  }
 }
 
 // The raw-HTML notes of one block, each with the draft line of its tag. The nth note about the same tag points at its nth place in the block.
@@ -223,6 +242,9 @@ export function withoutUpdateNotice(html) {
 // A diagram with change markers carries a count row; only then the page needs the delta styles and script.
 export const hasDelta = (html) => html.includes('class="am-delta-bar"');
 
+// A chart (src/components/chart.js) needs its own styles, as a formula needs the math ones.
+export const hasChart = (html) => html.includes('class="am-diagram am-chart"');
+
 function lightboxShell(ui, hasDiagrams) {
   if (!hasDiagrams) return '';
   return `<div class="am-lightbox" hidden aria-modal="true" role="dialog" aria-label="${esc(ui.diagram)}" data-expand="${esc(ui.expand)}">
@@ -243,35 +265,40 @@ function lightboxShell(ui, hasDiagrams) {
 `;
 }
 
-function shell({ meta, language, body, source, embedded, update }) {
+// Seconds the page waits before it closes its tab; the page shows the countdown (src/runtime/close-after-reply.js).
+const CLOSE_AFTER_SECONDS = 3;
+
+function shell({ meta, language, body, source, embedded, update, closeAfter }) {
   const { ui, labelKey } = language;
   const notice = updateNotice(ui, update, labelKey);
   const pick = (name, label, values, current) => `<label class="am-pick">${esc(label)}<select data-am="${name}">${values
     .map(([value, text]) => `<option value="${esc(value)}"${value === current ? ' selected' : ''}>${esc(text)}</option>`).join('')}</select></label>`;
   const root = { lang: language.htmlLang, dir: language.dir, theme: meta.theme, mode: meta.mode, style: meta.style };
+  // The one inline script, as the browser reads it: the policy pins a hash of exactly this text.
+  const script = `\n${RUNTIME_JS}${hasDelta(body) ? DELTA_JS : ''}${update ? UPDATE_JS : ''}${closeAfter ? CLOSE_AFTER_JS : ''}`;
   return `<!doctype html>
 ${rootTag(root)}
 <head>
 <meta charset="utf-8">
+${cspMeta([script], { live: true })}
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="generator" content="Answer me with HTML ${VERSION}">
 <title>${esc(meta.title || 'Answer me with HTML')}</title>
 <style>
-${pageCss(embedded, { diff: body.includes('class="am-codeblock am-codeblock--diff"'), delta: hasDelta(body), rtl: language.dir === 'rtl', math: hasMath(body), update: Boolean(update) })}
+${pageCss(embedded, { diff: body.includes('class="am-codeblock am-codeblock--diff"'), delta: hasDelta(body), rtl: language.dir === 'rtl', math: hasMath(body), chart: hasChart(body), update: Boolean(update), closeAfter, theme: meta.theme })}
 </style>
 </head>
 <body>
 <div class="am-toolbar"${rootCarrierAttrs(root)}>
 ${notice.button}${pick('theme', ui.theme, embedded.map((t) => [t.name, t.label[labelKey]]), meta.theme)}
 ${pick('mode', ui.modeLabel, Object.entries(ui.mode), meta.mode)}
-<button class="am-btn am-btn--reply" type="button" data-am="reply" data-ui="${esc(JSON.stringify({ ...ui.reply, done: ui.done, remarks: ui.remark.section, kinds: ui.remark.kinds }))}">${esc(ui.reply.button)}</button>
+<button class="am-btn am-btn--reply" type="button" data-am="reply" data-ui="${esc(JSON.stringify({ ...ui.reply, done: ui.done, remarks: ui.remark.section, kinds: ui.remark.kinds, ...(closeAfter ? { closeAfter: { seconds: CLOSE_AFTER_SECONDS, ...ui.closeAfter } } : {}) }))}">${esc(ui.reply.button)}</button>
 <button class="am-btn am-btn--remark" type="button" data-am="remark" data-ui="${esc(JSON.stringify(ui.remark))}">${esc(ui.remark.button)}</button>
 <button class="am-btn" type="button" data-am="copy" data-done="${esc(ui.done)}">${esc(ui.copy)}</button>
 </div>
 ${notice.popover}${withColophon(body, language)}
 ${lightboxShell(ui, body.includes('class="am-diagram'))}${sourceTag(source)}
-<script>
-${RUNTIME_JS}${language.dir === 'rtl' ? RTL_JS : ''}${hasDelta(body) ? DELTA_JS : ''}${update ? UPDATE_JS : ''}</script>
+<script>${script}</script>
 </body>
 </html>
 `;
